@@ -24,6 +24,25 @@ logger = logging.getLogger(__name__)
 """
 
 
+def get_model_doc(model, fields=None, exclude=None):
+    """
+    Generates the signature of a Django model class, similar to Django internals,
+    but respecting fields and exclude parameters:
+    - if fields is set, only those fields are included
+    - if exclude is set, those fields are excluded
+    """
+    field_names = []
+    for field in model._meta.get_fields():
+        if not field.concrete:
+            continue
+        if fields and field.name not in fields:
+            continue
+        if exclude and field.name in exclude:
+            continue
+        field_names.append(field.name)
+    return "%s(%s)" % (model.__name__, ", ".join(field_names))
+
+
 def generate_json_schema(model, fields=None, exclude=None):
     """
     Generate a MongoDB-style $jsonSchema from a Django model.
@@ -56,7 +75,7 @@ def generate_json_schema(model, fields=None, exclude=None):
     }
 
     schema = {
-        "description": (model.__doc__ or "").strip(),
+        "description": get_model_doc(model, fields, exclude),
         "$jsonSchema": {
             "bsonType": "object",
             "properties": {},
@@ -150,7 +169,7 @@ All other stages NOT SUPPORTED : $addFields, $set, $unset, $unwind ...
 
 def apply_json_mango_query(queryset: QuerySet, pipeline: list[dict],
                            allowed_models: list = None, extended_operators: list = None,
-                           text_search_fields: list | str = '*'):
+                           text_search_fields: list | str = '*', allowed_fields: list = None):
     """
     Apply a JSON-like query to a Django QuerySet using a subset of MangoDB aggregation pipeline syntax.
     see pipeline_dsl_spec() for details.
@@ -159,6 +178,7 @@ def apply_json_mango_query(queryset: QuerySet, pipeline: list[dict],
     :param allowed_models: List of allowed models for $lookup stages. If None, all models are allowed. Can be the string name or the Model class.
     :param extended_operators: List of Queryset API lookups to support as exetended operators. this interprets {"<field>":{"$<op>": value} as Q({field}__{op}=value)
     :param text_search_fields: List of field names to apply `$text` full-text search to. Use "*" to apply to all CharField and TextField fields of the model. Required if `$text` is used.
+    :param allowed_fields: List of field names that are allowed to be returned. If None, all fields are allowed.
     :return: an iterable (eventually the queryset) of JSON results.
     """
 
@@ -320,6 +340,17 @@ def apply_json_mango_query(queryset: QuerySet, pipeline: list[dict],
     if projection_fields:
         queryset = queryset.values(*projection_fields)
         return _postprocess_projection(queryset, projection_mapping)
+
+    # If no projection but we have allowed_fields, use them as implicit projection
+    if allowed_fields:
+        # Translate field names (e.g., _id -> pk) and validate they exist
+        translated_fields = []
+        for field in allowed_fields:
+            if field == "_id":
+                translated_fields.append("pk")
+            else:
+                translated_fields.append(field)
+        return _postprocess_projection(queryset.values(*translated_fields), None)
 
     return _postprocess_projection(queryset.values(), None)
 
@@ -589,7 +620,8 @@ class _QueryExecutor:
         ret = list(apply_json_mango_query(qs, search_pipeline,
                                            text_search_fields=instance.get_text_search_fields(),
                                            allowed_models=instance.get_published_models(),
-                                           extended_operators=instance.extra_filters))
+                                           extended_operators=instance.extra_filters,
+                                           allowed_fields=instance.fields))
 
         if not ret:
             if instance.output_as_resource:
